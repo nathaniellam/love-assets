@@ -38,251 +38,159 @@ local function getExtension(path)
   return ext
 end
 
-local function contains(t, v)
-  for _, u in ipairs(t) do
-    if u == v then
-      return true
-    end
-  end
-
-  return false
-end
-
 -----------------------------
 -- Public Interface
 -----------------------------
 
-assets._instance_num = 1
-function assets.new(opts)
+function assets.init(opts)
+  if assets._initialized then
+    error('assets has already been initialized')
+  end
+
   if type(opts) == 'number' then
     opts = {num_workers = opts}
   elseif type(opts) == 'nil' then
     opts = {num_workers = 1}
   end
-  local instance =
-    setmetatable(
-    {
-      _result_cache = {},
-      _workers = {},
-      _job_queue = {}
-    },
-    {__index = assets}
-  )
 
-  instance.job_channel_name = instance.JOB_CHANNEL_PREFIX .. assets._instance_num
-  instance.job_channel = love.thread.getChannel(instance.job_channel_name)
-  instance.result_channel_name = instance.RESULT_CHANNEL_PREFIX .. assets._instance_num
-  instance.result_channel = love.thread.getChannel(instance.result_channel_name)
-  instance.num_workers = opts.num_workers
-  for i = 1, instance.num_workers do
-    instance._workers[i] = instance:_create_worker()
+  local job_channel_name = opts.job_channel_name or assets.DEFAULT_JOB_CHANNEL_NAME
+  local result_channel_name = opts.result_channel_name or assets.DEFAULT_RESULT_CHANNEL_NAME
+
+  assets._initialized = true
+  assets._result_cache = {}
+  assets._workers = {}
+
+  assets.job_channel = love.thread.getChannel(job_channel_name)
+  assets.result_channel = love.thread.getChannel(result_channel_name)
+  assets.num_workers = opts.num_workers
+  for i = 1, assets.num_workers do
+    assets._workers[i] = assets._createWorker()
   end
-
-  return instance
 end
 
-function assets:load(id, path, loader, ...)
-  if not self._result_cache[id] then
+function assets.load(id, path, loader, ...)
+  if not assets._result_cache[id] then
     local entry = {
       id = id,
       path = path,
       args = {...},
       status = 'loading',
-      progress = 0,
       loader = loader
     }
-    self._result_cache[id] = entry
+    assets._result_cache[id] = entry
 
     -- If the asset is a streaming resource, then we can just create the object immediately since this will not block to
     -- read the file. Currently, videos and audio sources of type "stream" are the the only cases of this.
-    local ext = getExtension(path)
-    if loader == 'video' or ext == 'ogv' then
-      self:_create_asset(entry, nil)
-    elseif
-      (loader == 'audio' or contains(self.SUPPORTED_AUDIO_FORMATS, ext)) and
-        entry.args[1] == 'stream'
-     then
-      self:_create_asset(entry, nil)
+    local format = assets._getFormat(path, loader)
+    -- if format == 'video' then
+    --   assets._createAsset(entry, nil)
+    -- else
+    if format == 'audio' and entry.args[1] == 'stream' then
+      assets._createAsset(entry, nil)
     else
       -- Submit job for resources that need to be loaded
-      self.job_channel:push({id = id, path = path})
+      assets.job_channel:push({id = id, path = path, format = format})
     end
   end
 end
 
-function assets:load_sync(id, path, loader, ...)
+function assets.loadSync(id, path, loader, ...)
   local entry = {
     id = id,
     path = path,
     args = {...},
     status = 'loading',
-    progress = 0,
     loader = loader
   }
-  self._result_cache[id] = entry
-  self:_create_asset(entry, nil)
+  assets._result_cache[id] = entry
+  assets._createAsset(entry, nil)
 end
 
-function assets:unload(id, can_release)
-  local entry = self._result_cache[id]
+function assets.unload(id, can_release)
+  local entry = assets._result_cache[id]
   if entry and entry.result then
     if can_release then
       entry.result:release()
     end
-    self._result_cache[id] = nil
+    assets._result_cache[id] = nil
   end
 end
 
-function assets:unload_all(can_release)
+function assets.unloadAll(can_release)
   if can_release then
-    for _, entry in pairs(self._result_cache) do
+    for _, entry in pairs(assets._result_cache) do
       entry.result:release()
     end
   end
 
-  self._result_cache = {}
+  assets._result_cache = {}
 end
 
-function assets:status(id)
-  local entry = self._result_cache[id]
+function assets.status(id)
+  local entry = assets._result_cache[id]
   if entry then
-    return entry.status, entry.progress
+    return entry.status
   end
 
   return 'not found', nil
 end
 
-function assets:get(id)
-  local entry = self._result_cache[id]
+function assets.get(id)
+  local entry = assets._result_cache[id]
   if entry then
     if entry.status == 'loaded' then
       return entry.result
     else
-      return false, entry.err or 'Asset could not be loaded'
+      return nil, entry.err or 'Asset could not be loaded'
     end
   end
 
-  return false, 'Asset not found'
+  return nil, 'Asset not found'
 end
 
-function assets:update()
-  while self.result_channel:getCount() > 0 do
-    local entry_update = self.result_channel:pop()
-    local entry = self._result_cache[entry_update.id]
+function assets.register(loader_key, loader_fn)
+  local prev_loader = assets._loaders[loader_key]
+  assets._loaders[loader_key] = loader_fn
+  return prev_loader
+end
+
+function assets.unregister(loader_key)
+  local prev_loader = assets._loaders[loader_key]
+  assets._loaders[loader_key] = nil
+  return prev_loader
+end
+
+function assets.update()
+  while assets.result_channel:getCount() > 0 do
+    local entry_update = assets.result_channel:pop()
+    local entry = assets._result_cache[entry_update.id]
     if entry_update.err then
       entry.status = 'error'
       entry.err_message = entry_update.err
-    elseif entry_update.progress then
-      entry.progress = entry_update.progress
     elseif entry_update.data then
-      self:_create_asset(entry, entry_update.data)
+      assets._createAsset(entry, entry_update.data)
     end
   end
 end
 
-function assets:shutdown_workers()
-  -- Send shutdown signal to all workers
-  for _, worker in ipairs(self._workers) do
-    worker.side_channel:push(-1)
-  end
-
-  for _, _ in ipairs(self._workers) do
-    self.job_channel:push(-1)
+function assets.shutdownWorkers()
+  -- Remove any existing jobs and send shutdown signal to all workers
+  assets.job_channel:clear()
+  for _ = 1, assets.num_workers do
+    assets.job_channel:push(-1)
   end
 
   -- Wait for all workers to exit
-  for _, worker in ipairs(self._workers) do
-    worker.thread:wait()
+  for _, worker in ipairs(assets._workers) do
+    worker:wait()
   end
 end
 
 -- Constants
 
-assets.JOB_CHANNEL_PREFIX = 'assets_jobs_'
-assets.RESULT_CHANNEL_PREFIX = 'assets_results_'
-assets.CHUNK_SIZE = 1048576 -- 1 MB in bytes
-assets.WORK_THREAD_SOURCE =
-  [[
-  local job_ch, result_ch, side_ch, chunk_size = ...
-
-  while true do
-    local job = job_ch:demand()
-    if job == -1 then
-      -- Received exit command
-      return
-    else
-      local file, err = love.filesystem.newFile(job.path, 'r')
-      if err then
-        result_ch:supply({id = job.id, err = err})
-      else
-        local total_bytes = file:getSize()
-        local remaining_bytes = total_bytes
-        local contents = ''
-        while remaining_bytes > 0 do
-          -- Check if shutdown has been initiated to cancel loading
-          local value = side_ch:peek()
-          if value == -1 then
-            file:close()
-            return
-          end
-
-          -- Read next chunk and append to result
-          local read_bytes, num_read = file:read(chunk_size)
-          contents = contents .. read_bytes
-          remaining_bytes = remaining_bytes - num_read
-          result_ch:supply({id = job.id, progress = (total_bytes - remaining_bytes) / total_bytes})
-        end
-        file:close()
-        local data = love.filesystem.newFileData(contents, job.path)
-        result_ch:supply({id = job.id, data = data})
-      end
-    end
-  end
-]]
-
------------------------------
--- Private Interface
------------------------------
-
-function assets:_create_worker()
-  local worker = {}
-  local side_channel = love.thread.newChannel()
-  worker.thread = love.thread.newThread(self.WORK_THREAD_SOURCE)
-  worker.thread:start(self.job_channel, self.result_channel, side_channel, self.CHUNK_SIZE)
-  worker.side_channel = side_channel
-  return worker
-end
-
-function assets:_create_asset(entry, data)
-  entry.progress = 1
-  local loader = entry.loader or (data and data:getExtension()) or getExtension(entry.path)
-  if type(loader) ~= 'function' then
-    loader = self._loaders[loader] or self._loaders.data
-  end
-  entry.result = loader(entry.path, data, unpack(entry.args or {}))
-  entry.status = 'loaded'
-end
-
-assets._loaders = {}
-
--- Default loader, just returns FileData
-assets._loaders.data = function(_path, data)
-  return data
-end
-
-assets._loaders.image = function(path, data, ...)
-  return love.graphics.newImage(data or path, ...)
-end
-
+assets.DEFAULT_JOB_CHANNEL_NAME = 'assets_jobs'
+assets.DEFAULT_RESULT_CHANNEL_NAME = 'assets_results'
 assets.SUPPORTED_IMAGE_FORMATS = {'jpg', 'png', 'bmp'}
-for _, format in ipairs(assets.SUPPORTED_IMAGE_FORMATS) do
-  assets._loaders[format] = assets._loaders.image
-end
-
-assets._loaders.audio = function(path, data, ...)
-  return love.audio.newSource(data or path, ...)
-end
-
 assets.SUPPORTED_AUDIO_FORMATS = {
   'wav',
   'mp3',
@@ -315,6 +223,93 @@ assets.SUPPORTED_AUDIO_FORMATS = {
   'pat',
   'flac'
 }
+assets.WORKER_SOURCE =
+  [[
+require 'love.image'
+require 'love.sound'
+require 'love.video'
+local job_ch, result_ch = ...
+
+while true do
+  local job = job_ch:demand()
+  if job == -1 then
+    return
+  else
+    local data = nil
+    if job.format == 'audio' then
+      data = love.sound.newSoundData(job.path)
+    elseif job.format == 'image' then
+      if love.image.isCompressed(job.path) then
+        data = love.image.newCompressedData(job.path)
+      else
+        data = love.image.newImageData(job.path)
+      end
+    elseif job.format == 'video' then
+      data = love.video.newVideoStream(job.path)
+    else
+      data = love.filesystem.newFileData(job.path)
+    end
+    result_ch:push({id = job.id, data = data})
+  end
+end
+]]
+
+-----------------------------
+-- Private Interface
+-----------------------------
+
+function assets._createWorker()
+  local worker_thread = love.thread.newThread(assets.WORKER_SOURCE)
+  worker_thread:start(assets.job_channel, assets.result_channel)
+  return worker_thread
+end
+
+function assets._createAsset(entry, data)
+  local loader = entry.loader or getExtension(entry.path)
+  if type(loader) ~= 'function' then
+    loader = assets._loaders[loader] or assets._loaders.data
+  end
+  entry.result = loader(entry.path, data, unpack(entry.args or {}))
+  entry.status = 'loaded'
+end
+
+function assets._getFormat(path, loader)
+  local ext = getExtension(path)
+  local loader_fn = assets._loaders[loader or ext]
+  if loader_fn == assets._loaders.data then
+    return 'data'
+  elseif loader_fn == assets._loaders.image then
+    return 'image'
+  elseif loader_fn == assets._loaders.audio then
+    return 'audio'
+  elseif loader_fn == assets._loaders.video then
+    return 'video'
+  end
+
+  return 'data'
+end
+
+-- Built-in Loaders
+
+assets._loaders = {}
+
+-- Default loader, just returns FileData/ImageData/SoundData
+assets._loaders.data = function(_path, data)
+  return data
+end
+
+assets._loaders.image = function(path, data, ...)
+  return love.graphics.newImage(data or path, ...)
+end
+
+for _, format in ipairs(assets.SUPPORTED_IMAGE_FORMATS) do
+  assets._loaders[format] = assets._loaders.image
+end
+
+assets._loaders.audio = function(path, data, ...)
+  return love.audio.newSource(data or path, ...)
+end
+
 for _, format in ipairs(assets.SUPPORTED_AUDIO_FORMATS) do
   assets._loaders[format] = assets._loaders.audio
 end
@@ -341,8 +336,8 @@ assets._loaders.ogv = assets._loaders.video
 setmetatable(
   assets,
   {
-    __call = function(_, opts)
-      return assets.new(opts)
+    __call = function(_, ...)
+      return assets.load(...)
     end
   }
 )
