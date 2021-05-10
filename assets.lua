@@ -79,18 +79,8 @@ function assets.load(id, path, loader, ...)
     }
     assets._result_cache[id] = entry
 
-    -- If the asset is a streaming resource, then we can just create the object immediately since this will not block to
-    -- read the file. Currently, videos and audio sources of type "stream" are the the only cases of this.
-    local format = assets._getFormat(path, loader)
-    -- if format == 'video' then
-    --   assets._createAsset(entry, nil)
-    -- else
-    if format == 'audio' and entry.args[1] == 'stream' then
-      assets._createAsset(entry, nil)
-    else
-      -- Submit job for resources that need to be loaded
-      assets.job_channel:push({id = id, path = path, format = format})
-    end
+    local format = assets._getFormat(path, loader, ...)
+    assets.job_channel:push({id = id, path = path, format = format})
   end
 end
 
@@ -106,23 +96,15 @@ function assets.loadSync(id, path, loader, ...)
   assets._createAsset(entry, nil)
 end
 
-function assets.unload(id, can_release)
+function assets.remove(id)
   local entry = assets._result_cache[id]
   if entry and entry.result then
-    if can_release then
-      entry.result:release()
-    end
     assets._result_cache[id] = nil
+    return entry.result
   end
 end
 
-function assets.unloadAll(can_release)
-  if can_release then
-    for _, entry in pairs(assets._result_cache) do
-      entry.result:release()
-    end
-  end
-
+function assets.clear()
   assets._result_cache = {}
 end
 
@@ -238,6 +220,8 @@ while true do
     local data = nil
     if job.format == 'audio' then
       data = love.sound.newSoundData(job.path)
+    elseif job.format == 'audio-stream' then
+      data = love.sound.newDecoder(job.path)
     elseif job.format == 'image' then
       if love.image.isCompressed(job.path) then
         data = love.image.newCompressedData(job.path)
@@ -273,7 +257,7 @@ function assets._createAsset(entry, data)
   entry.status = 'loaded'
 end
 
-function assets._getFormat(path, loader)
+function assets._getFormat(path, loader, ...)
   local ext = getExtension(path)
   local loader_fn = assets._loaders[loader or ext]
   if loader_fn == assets._loaders.data then
@@ -281,6 +265,10 @@ function assets._getFormat(path, loader)
   elseif loader_fn == assets._loaders.image then
     return 'image'
   elseif loader_fn == assets._loaders.audio then
+    local type = ...
+    if type == 'stream' then
+      return 'audio-stream'
+    end
     return 'audio'
   elseif loader_fn == assets._loaders.video then
     return 'video'
