@@ -32,13 +32,13 @@ function love.load()
 end
 
 function love.update(dt)
-  assets.update()
+  assets.update() -- Make sure you update every frame
 end
 
 function love.draw()
   if assets.status('cool-sprite') == 'loaded' then
     local sprite = assets.get('cool-sprite')
-    love.graphics.draw(sprite, )
+    love.graphics.draw(sprite, 0, 0)
   end
 end
 ```
