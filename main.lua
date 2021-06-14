@@ -22,8 +22,7 @@ local asset_entries = {
   {
     'test-audio',
     'assets/you_win.ogg',
-    nil,
-    'stream',
+    {'ogg', 'stream'},
     once = function(asset)
       asset:play()
     end,
@@ -34,6 +33,7 @@ local asset_entries = {
   {
     'test-data',
     'assets/lorem_ipsum.txt',
+    'data',
     draw = function(asset)
       love.graphics.printf(asset:getString(), 0, 320, love.graphics.getWidth())
     end
@@ -41,7 +41,8 @@ local asset_entries = {
   {
     'test-custom',
     'assets/rectangle.txt',
-    function(_path, data)
+    'data',
+    function(data)
       local rect = {}
       local contents = data:getString()
       for k, v in string.gmatch(contents, '(%w+) = (%w+)') do
@@ -65,7 +66,7 @@ function love.update(dt)
 
   for _, asset_entry in ipairs(asset_entries) do
     local status = assets.status(asset_entry[1])
-    if status == 'loaded' then
+    if status == 'ready' then
       local asset = assets.get(asset_entry[1])
       if asset_entry.once then
         asset_entry.once(asset)
@@ -80,10 +81,10 @@ function love.draw()
   love.graphics.print('Click to load stuff', 300, 0)
 
   for i, asset_entry in ipairs(asset_entries) do
-    local status = assets.status(asset_entry[1])
-    love.graphics.print(asset_entry[1] .. ': ' .. status, 0, (i - 1) * 100)
+    local status, err = assets.status(asset_entry[1])
+    love.graphics.print(asset_entry[1] .. ': ' .. status .. ' ' .. (err or ''), 0, (i - 1) * 100)
 
-    if status == 'loaded' then
+    if status == 'ready' then
       local asset = assets.get(asset_entry[1])
       if asset_entry.draw then
         asset_entry.draw(asset)
@@ -95,7 +96,7 @@ end
 local next_idx = 1
 function love.mousepressed()
   if next_idx <= #asset_entries then
-    assets.load(unpack(asset_entries[next_idx]))
+    assets.add(unpack(asset_entries[next_idx]))
     next_idx = next_idx + 1
   end
 end

@@ -36,7 +36,7 @@ function love.update(dt)
 end
 
 function love.draw()
-  if assets.status('cool-sprite') == 'loaded' then
+  if assets.status('cool-sprite') == 'ready' then
     local sprite = assets.get('cool-sprite')
     love.graphics.draw(sprite, 0, 0)
   end
@@ -47,31 +47,26 @@ end
 
 ## assets.init(opts)
 
-Initializes the library. It should only be called once.
+Initializes the library. It should only be called once, typically in `love.load()`.
 
 ### Parameters
 
 - opts (table/number) Default = `{num_workers = 1}` Intialization options. When it is a number, it is equivalent to `{num_workers = opts}`.
   - opts.num_workers (number) Default = `1` Number of worker threads to create.
-  - opts.job_channel_name (string) Default = `'assets_jobs'` The name of the Channel used to send jobs to workers.
-  - opts.result_channel_name (string) Default = `'assets_results'` The name of the Channel used to receive results from workers.
+  - opts.onCancel (function) The function that receives loaded data for canceled assets. Signature is `function(id, data)` where id is the asset's id and data is the output of the asset's loader function.
 
-## assets.load(id, path, loader, ...)
+## assets.add(id, data, loader, initializer)
 
-Asynchronously load a resource at the given path. Subsequent calls to this function with the same id will do nothing until the asset with that id has been unloaded.
+If data is a string then, asynchronously load a resource at the given path, else add an existing asset. Subsequent calls to this function with the same id will override the asset. Loader and initializer are ignored when data is not a path.
 
 ### Parameters
 
 - id (any) **Required** The id used to track the resource.
-- path (string) **Required** The path to the resource.
-- loader (string/function) The name of the loader or the loader function itself.
-- ... (any) Extra args that get passed to the loader function.
+- data (string/any) **Required** The path to the resource or the resource itself.
+- loader (string/function/table) The name of the loader, the loader function itself or a table where the first entry is a string/function and the rest are extra args to the loader. Loader will be inferred by file extension if missing. If using a function, it cannot contain upvalues.
+- initializer (string/function/table) The name of the initializer, the initalizer function itself or a table where the first entry is a string/function and the rest are extra args to the initializer. Initializer will be inferred by file extension if missing.
 
-## assets.loadSync(id, path, loader, ...)
-
-Synchronously load a resource. Parameters are the same as `assets.load()`.
-
-## assets.remove(id)
+## assets.remove(id, destructor)
 
 Removes a resource from the assets cache.
 
@@ -81,7 +76,7 @@ Removes a resource from the assets cache.
 
 ### Outputs
 
-1. The resource that was removed.
+1. The resource that was removed if it was ready.
 
 ## assets.clear()
 
@@ -93,12 +88,24 @@ Retrieves the resource. If the resource does not exist, a second output is retur
 
 ### Parameters
 
-- id (any) **Required** The id used to load the resource.
+- id (any) **Required** The id used to add the resource.
 
 ### Outputs
 
-1. The resource if loaded, otherwise `nil`.
+1. The resource if ready, otherwise `nil`.
 2. The reason the resource was not returned, if the resource was `nil`.
+
+## assets.has(id)
+
+Determines if an id has been added.
+
+### Parameters
+
+- id (any) **Required** The id used to add the resource.
+
+### Outputs
+
+1. True if the resource was added, false otherwise
 
 ## assets.status(id)
 
@@ -110,36 +117,67 @@ Gets the status of the resource.
 
 ### Outputs
 
-1. The status of the resource which can be one of the following: `loaded`, `not found`, `error`, and `loading`.
+1. The status of the resource which can be one of the following: `ready`, `not found`, `error`, `canceled` and `loading`.
+2. The error message if the status is `error`, otherwise `nil`.
 
 ## assets.update()
 
-Updates the internals of the library. It should be called every frame.
+Updates the internals of the library. It should be called every frame, typically in `love.update(dt)`.
 
-## assets.register(loader_id, loader_fn)
+## assets.loader(loader_id, loader_fn)
 
-Adds a custom loader that can be used for loading resources.
+Adds a custom loader that can be used for loading resources. When using a custom library, if the library emits a global or you gave it a name, this will be accessible using _G inside the `loader_fn`. The function runs in the worker threads.
+
+NOTE: Do not use upvalues inside of `loader_fn`.
 
 ### Parameters
 
-- loader_id (any) **Required** The id that will be used in `assets.load()`/`assets.loadSync` to use this loader.
-- Loader_fn (function) **Required** The function that will be executed when this loader is used. It has the following signature: `function(path, data, ...)`. `path` is the path given. `data` is the data loaded by the worker thread (can be `nil`). `...` are any extra parameters provided at load.
+- loader_id (any) **Required** The id to refer to this loader.
+- Loader_fn (function) **Required** The function that will be executed when this loader is used. It has the following signature: `function(path, ...)`. `path` is the path to the resource. `...` are any extra parameters provided at add.
 
-## assets.unregister(loader_id)
+## assets.initializer(initializer_id, initializer_fn)
 
-Removes a custom loader by id.
+Adds a custom initializer that can be used for initializing resources. This is run in the main thread.
 
-### Outputs
+NOTE: Upvalues are allowed in `initializer_fn`.
 
-1. The function that was removed.
+### Parameters
+
+- initializer_id (any) **Required** The id to refer to this initializer.
+- initializer_fn (function) **Required** The function that will be executed when this initializer is used. It has the following signature: `function(data, ...)`. `data` is the loaded data for the resource. `...` are any extra parameters provided at add.
+
+## assets.require(path, name, initializer)
+
+Adds a custom library that can be used for loading resources.
+
+NOTE: Do not use upvalues inside of `initializer`.
+
+### Parameters
+
+- path (any) **Required** The path to the library.
+- name (string) The name of the library which loader functions can reference.
+- initializer (function) The function that will be executed when this loader is used. It has the following signature: `function(lib)`. `lib` is the return value of the resource. If a name is also specified, the initializer should return the value that will be assigned to that name in the global namespace for the worker threads. This initializer is different than the ones defined by `assets.initializer()`.
 
 ## assets.shutdownWorkers()
 
-Stops all worker threads. It should be called when game is being closed.
+Stops all worker threads. It should be called when game is being closed. Some threads may not exit quickly if they are in the middle of loading an asset.
 
-# Limitations
+## assets.iter()
 
-Due to how threads work in LÖVE, loaders always run in the main thread and receive the data that was loaded in the thread. This means you should be careful what you put in the loader since it will be running on the main thread, not a worker thread.
+Iterates through all assets. Can be used in `for` loops. Each iteration returns the `id`, `status` and `asset`. `asset` is the resource after it is ready, otherwise `nil`.
+
+```lua
+for id, status, asset in assets.iter() do
+  -- Do something with id, status and asset
+end
+
+```
+
+# Loader vs Initializer
+
+A loader is a function that runs in a worker thread. This means it cannot have upvalues when defined in the main thread. It also only has access to the worker thread environment. You must require libraries using `assets.require(...)` in order for them to be accessible to a loader. Loaders only receive the path to an asset plus any extra user args.
+
+An initializer is a function that runs in the main thread. This is usually for using functions that cannot be run in the worker threads. This means that these functions can have access to any upvalues since they will be run in the same environment they are defined in. If you want to add an asset without it going to a background worker, you should just prepare it outside and add it after it is ready.
 
 # Credits
 

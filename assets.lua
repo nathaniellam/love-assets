@@ -32,10 +32,13 @@ local assets = {
 -----------------------------
 
 local function getExtension(path)
-  local temp = love.filesystem.newFileData(path)
-  local ext = temp:getExtension()
-  temp:release()
-  return ext
+  if type(path) == 'string' then
+    local temp = love.filesystem.newFileData(path)
+    local ext = temp:getExtension()
+    temp:release()
+    return ext
+  end
+  return ''
 end
 
 -----------------------------
@@ -54,17 +57,18 @@ function assets.init(opts)
   end
 
   assets._initialized = true
-  assets._result_cache = {}
+  assets._asset_cache = {}
   assets._workers = {}
-  assets._job_queue = {}
+  assets._pending_job_queue = {}
   assets._lock = nil
+  assets._onCancel = opts.onCancel
 
   assets.job_channel = love.thread.newChannel()
   assets.result_channel = love.thread.newChannel()
   assets.lock_channel = love.thread.newChannel()
-  assets.num_workers = opts.num_workers
+  assets.num_workers = opts.num_workers or 1
   for i = 1, assets.num_workers do
-    assets._workers[i] = assets._createWorker(i)
+    assets._workers[i] = assets._createWorker()
   end
 
   for k, v in pairs(assets._loaders) do
@@ -72,103 +76,109 @@ function assets.init(opts)
   end
 end
 
-function assets.load(id, path, loader_id, finalizer_id)
-  if assets._result_cache[id] then
-    error('Attempted to load "' .. id .. '" without removing it first')
-  end
+function assets.add(id, path, loader_id, initializer_id)
+  local rev = (assets._asset_cache[id] and assets._asset_cache[id].rev or 0) + 1
+  if type(path) == 'string' then
+    local loader, loader_type, loader_args = assets._extractLoader(loader_id or getExtension(path))
+    local initializer, initializer_args =
+      assets._extractInitializer(initializer_id or getExtension(path))
+    local asset = {
+      id = id,
+      rev = rev,
+      path = path,
+      status = 'loading',
+      loader = loader,
+      loader_type = loader_type,
+      loader_args = loader_args,
+      initializer = initializer,
+      initializer_args = initializer_args
+    }
+    assets._asset_cache[id] = asset
 
-  finalizer_id = finalizer_id or loader_id
-  local loader, loader_type, loader_args =
-    assets._extractLoader(loader_id or getExtension(path) or 'default')
-  local finalizer, finalizer_type, finalizer_args =
-    assets._extractFinalizer(finalizer_id or getExtension(path) or 'default')
-  local entry = {
-    id = id,
-    path = path,
-    status = 'loading',
-    loader = loader,
-    loader_type = loader_type,
-    loader_args = loader_args,
-    finalizer = (finalizer_type == 'fn' and finalizer) or assets._finalizers[finalizer],
-    finalizer_args = finalizer_args
-  }
-  assets._result_cache[id] = entry
-
-  local job = {
-    'asset',
-    id = id,
-    path = path,
-    loader = loader,
-    loader_type = loader_type,
-    loader_args = loader_args
-  }
-  if assets._lock then
-    table.insert(assets._job_queue, job)
+    local job = {
+      'asset',
+      id = id,
+      rev = rev,
+      path = path,
+      loader = loader,
+      loader_type = loader_type,
+      loader_args = loader_args
+    }
+    table.insert(assets._pending_job_queue, job)
   else
-    assets.job_channel:push(job)
+    local asset = {
+      id = id,
+      rev = rev,
+      status = 'ready',
+      result = path
+    }
+    assets._asset_cache[id] = asset
   end
 end
 
-function assets.add(id, data)
-  local entry = {
-    id = id,
-    status = 'loaded',
-    result = data
-  }
-  assets._result_cache[id] = entry
-end
-
-function assets.remove(id, destructor)
-  local entry = assets._result_cache[id]
-  if entry and entry.result then
-    assets._result_cache[id] = nil
-    return entry.result
+function assets.remove(id)
+  local asset = assets._asset_cache[id]
+  if not asset then
+    error('Attempted to remove ' .. id .. ' which was not found')
+  end
+  if asset.status == 'ready' then
+    assets._asset_cache[id] = nil
+    return asset.result
+  elseif asset.status == 'loading' then
+    asset.status = 'canceled'
+  elseif asset.status == 'error' then
+    assets._asset_cache[id] = nil
   end
 end
 
-function assets.clear(destructor)
-  assets.job_channel:clear()
-  assets._result_cache = {}
+function assets.clear()
+  for id, asset in pairs(assets._asset_cache) do
+    if asset.status == 'ready' then
+      assets._asset_cache[id] = nil
+    elseif asset.status == 'loading' then
+      asset.status = 'canceled'
+    end
+  end
+  assets._pending_job_queue = {}
 end
 
 function assets.status(id)
-  local entry = assets._result_cache[id]
-  if entry then
-    return entry.status, entry.err
+  local asset = assets._asset_cache[id]
+  if asset then
+    return asset.status, asset.err
   end
 
   return 'not found', nil
 end
 
 function assets.get(id)
-  local entry = assets._result_cache[id]
-  if entry then
-    if entry.status == 'loaded' then
-      return entry.result
+  local asset = assets._asset_cache[id]
+  if not asset then
+    error('Attempted to get ' .. id .. ' which was not found')
+  end
+  if asset then
+    if asset.status == 'ready' then
+      return asset.result
     else
-      return nil, entry.err or 'Asset could not be loaded'
+      return nil, 'Asset not ready'
     end
   end
 
   return nil, 'Asset not found'
 end
 
+function assets.has(id)
+  local asset = assets._asset_cache[id]
+  if asset then
+    return true
+  end
+  return false
+end
+
 function assets.loader(id, fn)
   local dump = string.dump(fn)
   local job = {'loader', id = id, fn = dump}
-  if assets._lock then
-    table.insert(assets._job_queue, job)
-  else
-    assets._lock = true
-    assets.lock_channel:push(assets.num_workers)
-    for _ = 1, assets.num_workers do
-      assets.job_channel:push(job)
-    end
-  end
-end
-
-function assets.finalizer(id, fn)
-  assets._finalizers[id] = fn
+  table.insert(assets._pending_job_queue, job)
 end
 
 function assets.require(path, name, initializer)
@@ -179,14 +189,21 @@ function assets.require(path, name, initializer)
   if initializer then
     initializer = string.dump(initializer)
   end
-  local job = {'lib', path = path, name = name, initializer = initializer}
-  if assets._lock then
-    table.insert(assets._job_queue, job)
-  else
-    assets._lock = true
-    assets.lock_channel:push(assets.num_workers)
-    for _ = 1, assets.num_workers do
-      assets.job_channel:push(job)
+  local job = {'require', path = path, name = name, initializer = initializer}
+  table.insert(assets._pending_job_queue, job)
+end
+
+function assets.initializer(id, fn)
+  assets._initializers[id] = fn
+end
+
+function assets.iter()
+  local gen, state, prev = pairs(assets._asset_cache)
+  return function()
+    local id, asset = gen(state, prev)
+    if id ~= nil then
+      prev = id
+      return id, asset.status, asset.data
     end
   end
 end
@@ -195,39 +212,70 @@ function assets.update()
   while assets.result_channel:getCount() > 0 do
     local result = assets.result_channel:pop()
     if result[1] == 'asset' then
-      local asset = assets._result_cache[result.id]
-      if result.err then
-        asset.status = 'error'
-        asset.err = result.err
-        if assets.onError then
-          assets.onError(asset.id, result.err)
+      local asset = assets._asset_cache[result.id]
+      if asset.rev == result.rev then
+        if result.err then
+          if asset.status == 'canceled' then
+            assets._asset_cache[asset.id] = nil
+          else
+            asset.status = 'error'
+            asset.err = result.err
+          end
+        elseif result.data then
+          if asset.status == 'canceled' then
+            if assets.onCancel then
+              assets.onCancel(result.id, result.data)
+            end
+            assets._asset_cache[asset.id] = nil
+          else
+            if asset.initializer then
+              asset.result = asset.initializer(result.data, unpack(asset.initializer_args))
+            else
+              asset.result = result.data
+            end
+            asset.status = 'ready'
+          end
         end
-      elseif result.data then
-        if asset.finalizer then
-          asset.result = asset.finalizer(result.data, unpack(asset.finalizer_args))
-        else
-          asset.result = result.data
+      else
+        -- When revision differs we can cancel previous entry
+        if assets.onCancel then
+          assets.onCancel(result.id, result.data)
         end
-        asset.status = 'loaded'
+        assets._asset_cache[asset.id] = nil
       end
-    elseif result[1] == 'lib' then
+    elseif result[1] == 'require' then
       if result.status == 'done' then
         assets._lock = false
-        assets._nextJob()
       elseif result.status == 'error' then
-        if assets.onError then
-          assets.onError(result.path, result.err)
-        end
+        error('assets could not require "' .. result.path .. '" due to:\n' .. result.err)
       end
     elseif result[1] == 'loader' then
       if result.status == 'done' then
         assets._lock = false
-        assets._nextJob()
       elseif result.status == 'error' then
-        if assets.onError then
-          assets.onError(result.id, result.err)
-        end
+        error('assets could not setup loader "' .. result.id .. '" due to:\n' .. result.err)
       end
+    end
+  end
+
+  while #assets._pending_job_queue > 0 do
+    local job = table.remove(assets._pending_job_queue, 1)
+    if job[1] == 'loader' then
+      assets._lock = true
+      assets.lock_channel:push(assets.num_workers)
+      for _ = 1, assets.num_workers do
+        assets.job_channel:push(job)
+      end
+      break
+    elseif job[1] == 'require' then
+      assets._lock = true
+      assets.lock_channel:push(assets.num_workers)
+      for _ = 1, assets.num_workers do
+        assets.job_channel:push(job)
+      end
+      break
+    elseif job[1] == 'asset' then
+      assets.job_channel:push(job)
     end
   end
 end
@@ -240,10 +288,17 @@ function assets.shutdownWorkers()
   end
   -- Unlock any threads that might be loading a loader or library
   assets.lock_channel:push(1000000)
+  assets._pending_job_queue = {}
 
   -- Wait for all workers to exit
   for _, worker in ipairs(assets._workers) do
     worker:wait()
+  end
+end
+
+function assets.onCancel(...)
+  if assets._onCancel then
+    assets._onCancel(...)
   end
 end
 
@@ -288,7 +343,7 @@ local function threadFn(...)
   require 'love.image'
   require 'love.sound'
   require 'love.video'
-  local thread_id, job_ch, result_ch, lock_ch = ...
+  local job_ch, result_ch, lock_ch = ...
   local loaders = {}
 
   while true do
@@ -302,18 +357,33 @@ local function threadFn(...)
       if fn then
         loaders[job.id] = fn
       else
-        result_ch:push({'loader', thread_id = thread_id, id = job.id, status = 'error', err = err})
+        result_ch:push(
+          {
+            'loader',
+            id = job.id,
+            status = 'error',
+            err = err
+          }
+        )
+        -- Stop thread due to irrecoverable error
+        return
       end
 
       -- Sync up with other threads
       local counter = lock_ch:demand()
       counter = counter - 1
       if counter <= 0 then
-        result_ch:push({'loader', thread_id = thread_id, id = job.id, status = 'done'})
+        result_ch:push(
+          {
+            'loader',
+            id = job.id,
+            status = 'done'
+          }
+        )
       else
         lock_ch:push(counter)
       end
-    elseif job[1] == 'lib' then
+    elseif job[1] == 'require' then
       -- Add library
       local succ, lib = pcall(require, job.path)
       local result = nil
@@ -328,15 +398,19 @@ local function threadFn(...)
               end
             else
               result = {
-                'lib',
-                thread_id = thread_id,
+                'require',
                 path = job.path,
                 status = 'error',
                 err = initLib
               }
             end
           else
-            result = {'lib', thread_id = thread_id, path = job.path, status = 'error', err = err}
+            result = {
+              'require',
+              path = job.path,
+              status = 'error',
+              err = err
+            }
           end
         else
           if job.name then
@@ -344,42 +418,57 @@ local function threadFn(...)
           end
         end
       else
-        result = {'lib', thread_id = thread_id, path = job.path, status = 'error', err = lib}
+        result = {
+          'require',
+          path = job.path,
+          status = 'error',
+          err = lib
+        }
       end
 
       if result then
         result_ch:push(result)
+        if result.status == 'error' then
+          -- Stop thread due to irrecoverable error
+          return
+        end
       end
 
       -- Sync up with other threads
       local counter = lock_ch:demand()
       counter = counter - 1
       if counter <= 0 then
-        result_ch:push({'lib', thread_id = thread_id, path = job.path, status = 'done'})
+        result_ch:push(
+          {
+            'require',
+            path = job.path,
+            status = 'done'
+          }
+        )
       else
         lock_ch:push(counter)
       end
     else
       -- Load asset
-      local result
+      local result = {'asset', id = job.id, rev = job.rev}
       if job.loader_type == 'str' then
         local succ, data = pcall(loaders[job.loader], job.path, unpack(job.loader_args))
         if succ then
-          result = {'asset', thread_id = thread_id, id = job.id, data = data}
+          result.data = data
         else
-          result = {'asset', thread_id = thread_id, id = job.id, err = data}
+          result.err = data
         end
       elseif job.loader_type == 'fn' then
         local fn, err = loadstring(job.loader)
         if fn then
           local succ, data = pcall(loaders[job.loader], job.path, unpack(job.loader_args))
           if succ then
-            result = {'asset', thread_id = thread_id, id = job.id, data = data}
+            result.data = data
           else
-            result = {'asset', thread_id = thread_id, id = job.id, err = data}
+            result.err = data
           end
         else
-          result = {'asset', thread_id = thread_id, id = job.id, err = err}
+          result.err = err
         end
       end
 
@@ -396,61 +485,38 @@ assets.WORKER_DUMP = string.dump(threadFn)
 
 -- Helpers
 
-function assets._createWorker(id)
+function assets._createWorker()
   local worker_thread =
     love.thread.newThread(love.filesystem.newFileData(assets.WORKER_DUMP, 'assets-thread.lua'))
-  worker_thread:start(id, assets.job_channel, assets.result_channel, assets.lock_channel)
+  worker_thread:start(assets.job_channel, assets.result_channel, assets.lock_channel)
   return worker_thread
 end
 
-function assets._extractLoader(f)
+function assets._extractLoader(id)
   local args = {}
-  if type(f) == 'table' then
-    args = {select(2, unpack(f))}
-    f = f[1]
+  if type(id) == 'table' then
+    args = {select(2, unpack(id))}
+    id = id[1]
   end
 
-  if type(f) == 'function' then
-    return string.dump(f), 'fn', args
-  elseif type(f) == 'string' then
-    return f, 'str', args
+  if type(id) == 'function' then
+    return string.dump(id), 'fn', args
+  elseif type(id) == 'string' then
+    return id, 'str', args
   end
 end
 
-function assets._extractFinalizer(f)
+function assets._extractInitializer(id)
   local args = {}
-  if type(f) == 'table' then
-    args = {select(2, unpack(f))}
-    f = f[1]
+  if type(id) == 'table' then
+    args = {select(2, unpack(id))}
+    id = id[1]
   end
 
-  if type(f) == 'function' then
-    return f, 'fn', args
-  elseif type(f) == 'string' then
-    return f, 'str', args
-  end
-end
-
-function assets._nextJob()
-  while #assets._job_queue > 0 do
-    local job = table.remove(assets._job_queue, 1)
-    if job[1] == 'loader' then
-      assets._lock = true
-      assets.lock_channel:push(assets.num_workers)
-      for _ = 1, assets.num_workers do
-        assets.job_channel:push(job)
-      end
-      return
-    elseif job[1] == 'lib' then
-      assets._lock = true
-      assets.lock_channel:push(assets.num_workers)
-      for _ = 1, assets.num_workers do
-        assets.job_channel:push(job)
-      end
-      return
-    elseif job[1] == 'asset' then
-      assets.job_channel:push(job)
-    end
+  if type(id) == 'function' then
+    return id, args
+  elseif type(id) == 'string' then
+    return assets._initializers[id], args
   end
 end
 
@@ -461,7 +527,6 @@ assets._loaders = {}
 assets._loaders.data = function(path)
   return love.filesystem.newFileData(path)
 end
-assets._loaders.default = assets._loaders.data
 
 assets._loaders.audio = function(path, ...)
   return love.audio.newSource(path, ...)
@@ -505,51 +570,41 @@ end
 assets._loaders.ogv = assets._loaders.video
 assets._loaders.videoStream = assets._loaders.video
 
--- Built-in finalizers
+-- Built-in initializers
 
-assets._finalizers = {}
+assets._initializers = {}
 
--- Default finalizer, just returns FileData/ImageData/SoundData
-assets._finalizers.data = function(data)
+-- Default initializer, just returns FileData/ImageData/SoundData
+assets._initializers.data = function(data)
   return data
 end
-assets._finalizers.default = assets._finalizers.data
 
-assets._finalizers.image = function(data, ...)
+assets._initializers.image = function(data, ...)
   return love.graphics.newImage(data, ...)
 end
 
 for _, format in ipairs(assets.SUPPORTED_IMAGE_FORMATS) do
-  assets._finalizers[format] = assets._finalizers.image
+  assets._initializers[format] = assets._initializers.image
 end
 
-assets._finalizers.audio = assets._finalizers.data
+assets._initializers.audio = assets._initializers.data
 
 for _, format in ipairs(assets.SUPPORTED_AUDIO_FORMATS) do
-  assets._finalizers[format] = assets._finalizers.audio
+  assets._initializers[format] = assets._initializers.audio
 end
 
-assets._finalizers.imagefont = function(data, ...)
+assets._initializers.imagefont = function(data, ...)
   return love.graphics.newImageFont(data, ...)
 end
 
-assets._finalizers.font = function(data, ...)
+assets._initializers.font = function(data, ...)
   return love.graphics.newFont(data, ...)
 end
-assets._finalizers.ttf = assets._finalizers.font
+assets._initializers.ttf = assets._initializers.font
 
-assets._finalizers.video = function(data, ...)
+assets._initializers.video = function(data, ...)
   return love.graphics.newVideo(data, ...)
 end
-assets._finalizers.ogv = assets._finalizers.video
-
-setmetatable(
-  assets,
-  {
-    __call = function(_, ...)
-      return assets.load(...)
-    end
-  }
-)
+assets._initializers.ogv = assets._initializers.video
 
 return assets
